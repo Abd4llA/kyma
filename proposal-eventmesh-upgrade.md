@@ -3,67 +3,116 @@
 ## Contents
 
 1. [Expectation](#expectation)
-2. [Steps](#steps)
-   1. [Set up new event mesh for existing Applications](#1-set-up-new-event-mesh-for-existing-applications)
-   2. [Deploy compatibility layer](#2-deploy-compatibility-layer)
-   3. [Drain legacy message channels](#3-drain-legacy-message-channels)
-   4. [Purge old event mesh](#4-purge-old-event-mesh)
-3. [Clean up](#clean-up)
+2. [Overview](#overview)
+3. [First Kyma upgrade : 1.11](#first-kyma-upgrade--111)
+     - [I. Missing HttpSource objects](#i-missing-httpsource-objects)
+     - [II. Legacy endpoints compatibility](#ii-legacy-endpoints-compatibility)
+     - [III. User namespace migration](#iii-user-namespace-migration)
+4. [Second Kyma upgrade : 1.12](#second-kyma-upgrade--112)
+     - [I. Purge event-bus component](#i-purge-event-bus-component)
 
 ## Expectation
 
 At the end of the Kyma upgrade, the user is left with an event mesh that has feature parity with the previous Kyma
 version, without the need for any manual configuration and without message loss.
 
-## Steps
+## Overview
 
-The upgrade is performed in a single Kyma release. There is technically no deprecation phase for the old event mesh
-solution, which will be removed entirely from the target cluster in case the upgrade procedure described in this
-document runs successfully.
+The upgrade happens in two steps over two Kyma releases to avoid creating a major disruption. In
+the first step, we ensure Kyma migrated totally to the new Knative Eventing mesh and that `Event Bus` is no longer
+functioning. In the second step, we remove leftovers from all other charts and
+delete the `event-bus` release in a manual step documented in Kyma upgrade guide.
 
-All the steps described below are orchestrated by the Kyma operator. During a Kyma upgrade, the operator proceeds
+<!--
+described below are orchestrated by the Kyma operator. During a Kyma upgrade, the operator proceeds
 component by component, iteratively. The most rational place to hook our migration logic is at the level of the
 `cluster-essentials` component, which is the [very first chart](./installation/resources/installer-cr.yaml.tpl#L13-L15)
 defined in the `Installation` object, so we can clear the path from there for the actual components' upgrades.
+-->
 
 Each of the steps described below is implemented as a Kubernetes `Job` triggered by a `pre-upgrade` Helm hook. A
 predictable ordering is enforced using the `helm.sh/hook-weight` annotation.
 
 A failed step restores the state of the cluster as it was when the step started.
 
-### 1. Set up new event mesh for existing Applications
+## First Kyma upgrade : 1.11
 
-**Logical**
+The goal of this step is that the existing `event-bus` objects have their Knative Eventing mesh equivalence ones and
+that`Event Bus` is no longer running.
 
-Existing eventing components get replicated onto the new event mesh, for each Kyma application. As a side effect, each
-application can technically support both event meshes, old and new, for the duration of this first step.
+### I. Missing HttpSource objects
 
-**Technical**
+#### Changes summary
 
-Self-contained migration logic delivered as a container image that creates `Trigger` objects. No API object gets deleted
-in this step.
+| Name | Description | Artifact |
+|------|-------------|----------|
+|HttpSource sync binary| A Go binary which creates missing HttpSources | Docker image|
+|`application-connector` `pre-upgrade` hook | A `pre-upgrade` Job which will be executed when Kyma installer upgrades the `application-connector` chart |`application-connector` new version |   
 
-### 2. Deploy compatibility layer
+#### Execution logic 
 
-**Logical**
+- Create an `HttpSource` for each existing `Application` which has no existing one already.
+- Wait, check for failure conditions and fail if any of them are true.
+ 
+#### Failure conditions 
+The job should fail when any of those conditions are true so that the release is marked as failed.
+ 
+- If `HttpSource` or `Channel` are not ready after 2 min
+- Errors on creating an `HttpSource`
+- If it's observed that there is an `HttpSource` adapter but no `Channel`
 
-Messages sent to legacy APIs get routed to the new event mesh.
+### II. Legacy endpoints compatibility
 
-**Technical**
+#### Changes summary
 
-_To be defined (may be part of an existing component, or a separate component)_
+| Name | Description | Artifact |
+|------|-------------|----------|
+|`event-service` build| `event-service` providing backward compatibility|Docker image| 
+|`application` chart | `application` chart includes the new `event-service` docker image|[application](https://github.com/kyma-project/kyma/tree/master/components/application-operator/charts/application) new chart version| 
+|`application-operator` build| A new `application-operator` build that includes the new `application` chart version in previous step|Docker image| 
+|`application-connector` chart |`application-connector` new chart version with the updated `application-operator`|[application-connector](https://github.com/kyma-project/kyma/tree/master/resources/application-connector) new chart version|
+|`application-connector` `post-upgrade` hook| A `post-upgrade` k8s job that checks if all applications event-services were upgraded correctly and fails if otherwise |`application-connector` new version| 
 
-### 3. Drain legacy message channels
 
-**Logical**
+The new `Event Service` should serve legacy endpoint `/v1/events` and route them to the proper event mesh `HttpSource` adapter.
 
-In-flight messages sent to legacy APIs must be delivered before the old event mesh gets shut down.
+#### Execution logic
 
-**Technical**
+- Once the `application-connector` gets upgraded, `application-operator` pods will restart.
+- Each `Application` has a helm release with the application name (e.g. `commerce`). 
+- The new `application` chart includes the new `event-service` deployment.
+- When starting, the `application-operator` will compare the `application` chart version in its folder with the version of each release (e.g. `commerce-prod`, `varkes`, etc ) and upgrade it if needed.
+- After `application` releases are upgraded the new `event-service` pods will restart and the new ones will start serving the legacy endpoint and routing the events to the HttpSource.
+- The `post-upgrade` Job of the `application-connector` chart should wait, check for failure conditions and fail if any of them are true.
+ 
+#### Failure conditions 
+The `post-upgrade` job should fail when
 
-To avoid over-engineering, we decided to simply observe a grace period of 60sec to allow the delivery of in-flight
-events to complete before proceeding with the next step. Metrics exposed by data Channels will not be taken into
-account, unprocessed events will be lost.
+- Any of the `event-service` instances are not updated
+- Any of the `event-service` instances are failing
+
+#### III. User namespace migration
+
+| Name | Description | Artifact |
+|------|-------------|----------|
+|Recreate `ServiceInstance` objects| A Go binary which removes the ServiceInstance | Docker image|
+|`application-connector` `pre-upgrade` hook | A `pre-upgrade` Job which will be executed when Kyma installer upgrades the `application-connector` chart |`application-connector` new version |   
+
+
+## Second Kyma upgrade : 1.12
+
+### I. Purge event-bus component
+TBD
+
+
+|`event-service` build| `event-service` providing backward compatibility|Docker image| 
+|`application` chart | `application` chart includes the new `event-service` docker image|[application](https://github.com/kyma-project/kyma/tree/master/components/application-operator/charts/application) new chart version| 
+|`application-operator` build| A new `application-operator` build that includes the new `application` chart version in previous step|Docker image| 
+|`application-connector` chart |`application-connector` new chart version with the updated `application-operator`|[application-connector](https://github.com/kyma-project/kyma/tree/master/resources/application-connector) new chart version|
+|`application-connector` `post-upgrade` hook| A `post-upgrade` k8s job that checks if all applications event-services were upgraded correctly and fails if otherwise |`application-connector` new version| 
+
+
+
 
 ### 4. Purge old event mesh
 
